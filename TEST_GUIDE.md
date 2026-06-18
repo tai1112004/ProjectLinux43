@@ -157,7 +157,7 @@ Module 2 gom cac demo C de minh hoa lap trinh he thong Linux o userspace. Thay v
 
 - `process_mgmt`: minh hoa cach Linux tao process con bang `fork`, thay the chuong trinh bang `exec`, parent doi child bang `waitpid`, doc thong tin process trong `/proc`, va gui/bat signal.
 - `file_ops`: minh hoa low-level file I/O khong qua `stdio`, doc/ghi theo offset, map file vao memory bang `mmap`, va theo doi su kien file bang `inotify`.
-- `socket_demo`: minh hoa network programming voi TCP server/client, `bind`, `listen`, `accept`, `connect`, `recv`, `send`, `select` va xu ly client bang `fork`.
+- `socket_demo`: minh hoa cach viet HTTP server bang TCP socket voi `bind`, `listen`, `accept`, `recv`, `send` va xu ly request bang `fork`.
 - `network_info`: minh hoa cach lay thong tin card mang bang `getifaddrs`, lay MAC bang `ioctl`, va doc thong ke RX/TX tu `/proc/net/dev`.
 - `main_demo`: menu tong de chay cac binary demo da build.
 
@@ -187,8 +187,11 @@ Ky vong ket qua:
 
 - `process_mgmt`: in PID child, doc `/proc/<pid>/status`, gui signal, chay `/bin/ls`.
 - `file_ops`: tao file tam, ghi/doc low-level I/O, sua bang `mmap`, watch `/tmp` bang `inotify`.
-- `socket_demo`: tao TCP echo server local port `9090`, client gui chuoi va nhan echo.
+- `socket_demo`: tao HTTP server local port `9090`; mo `http://127.0.0.1:9090/` trong trinh duyet de xem trang HTML do chuong trinh C tra ve.
 - `network_info`: in bang interface, IPv4/IPv6, MAC, RX/TX bytes.
+
+Voi `socket_demo`, server se chay lien tuc. Sau khi mo trang tren trinh duyet,
+quay lai terminal va nhan `Ctrl+C` de dung server.
 
 Luu y voi `file_ops`: khi dang watch `/tmp`, co the mo terminal khac va chay:
 

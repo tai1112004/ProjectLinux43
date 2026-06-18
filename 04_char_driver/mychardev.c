@@ -96,6 +96,32 @@ static ssize_t my_write(struct file *file, const char __user *user_buffer, size_
 	return len;
 }
 
+static loff_t my_llseek(struct file *file, loff_t offset, int whence)
+{
+	struct my_device_data *dev = file->private_data;
+	loff_t new_offset;
+
+	switch (whence) {
+	case SEEK_SET:
+		new_offset = offset;
+		break;
+	case SEEK_CUR:
+		new_offset = file->f_pos + offset;
+		break;
+	case SEEK_END:
+		new_offset = dev->size + offset;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (new_offset < 0 || new_offset > MY_BUFFER_SIZE)
+		return -EINVAL;
+
+	file->f_pos = new_offset;
+	return new_offset;
+}
+
 static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct my_device_data *dev = file->private_data;
@@ -131,6 +157,7 @@ static const struct file_operations my_fops = {
 	.release = my_release,
 	.read = my_read,
 	.write = my_write,
+	.llseek = my_llseek,
 	.unlocked_ioctl = my_ioctl,
 };
 

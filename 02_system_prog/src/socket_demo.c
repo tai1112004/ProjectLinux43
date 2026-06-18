@@ -2,79 +2,182 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
-#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define HOST "127.0.0.1"
+#define PORT 9090
 #define NC "\033[0m"
 #define GREEN "\033[32m"
 #define RED "\033[31m"
 #define YELLOW "\033[33m"
-#define SERVER(fmt, ...) printf(YELLOW "[SOCK][SERVER] " fmt NC "\n", ##__VA_ARGS__)
-#define CLIENT(fmt, ...) printf(GREEN "[SOCK][CLIENT] " fmt NC "\n", ##__VA_ARGS__)
-#define ERR(fmt, ...) fprintf(stderr, RED "[SOCK][ERR] " fmt NC "\n", ##__VA_ARGS__)
+#define SERVER(fmt, ...) printf(YELLOW "[HTTP][SERVER] " fmt NC "\n", ##__VA_ARGS__)
+#define OK(fmt, ...) printf(GREEN "[HTTP][OK] " fmt NC "\n", ##__VA_ARGS__)
+#define ERR(fmt, ...) fprintf(stderr, RED "[HTTP][ERR] " fmt NC "\n", ##__VA_ARGS__)
 
-static void handle_client(int cfd) {
-    char buf[256];
-    ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
-    if (n > 0) {
-        buf[n] = '\0';
-        SERVER("received: %s", buf);
-        send(cfd, buf, (size_t)n, 0);
-    }
-    close(cfd);
+static volatile sig_atomic_t running = 1;
+
+static void stop_server(int sig)
+{
+    (void)sig;
+    running = 0;
 }
 
-static void *server_thread(void *arg) {
-    (void)arg;
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    int yes = 1;
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons(9090)};
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { ERR("bind: %s", strerror(errno)); return NULL; }
-    listen(sfd, 8);
-    SERVER("listening on 127.0.0.1:9090");
+static int send_all(int fd, const char *data, size_t length)
+{
+    size_t sent = 0;
 
-    fd_set rfds;
-    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-    FD_ZERO(&rfds);
-    FD_SET(sfd, &rfds);
-    if (select(sfd + 1, &rfds, NULL, NULL, &tv) > 0) {
-        int cfd = accept(sfd, NULL, NULL);
-        if (cfd >= 0) {
-            pid_t pid = fork();
-            if (pid == 0) { handle_client(cfd); _exit(0); }
-            close(cfd);
-            waitpid(pid, NULL, 0);
+    while (sent < length) {
+        ssize_t n = send(fd, data + sent, length - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
         }
+        sent += (size_t)n;
     }
-    close(sfd);
-    return NULL;
+    return 0;
 }
 
-int main(void) {
-    pthread_t tid;
-    pthread_create(&tid, NULL, server_thread, NULL);
-    sleep(1);
+static void handle_client(int client_fd, const struct sockaddr_in *client_addr)
+{
+    char request[4096] = {0};
+    char response[8192];
+    const char *body =
+        "<!doctype html>"
+        "<html lang=\"vi\">"
+        "<head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Linux Socket Demo</title>"
+        "<style>"
+        "body{margin:0;min-height:100vh;display:grid;place-items:center;"
+        "background:#f4f7fb;color:#172033;font:16px/1.6 system-ui,sans-serif}"
+        "main{width:min(680px,calc(100% - 40px));border:1px solid #d9e1ec;"
+        "background:white;padding:32px;border-radius:8px;box-shadow:0 16px 40px #17203318}"
+        "h1{margin:0 0 12px;font-size:30px}code{background:#edf2f7;padding:3px 6px;"
+        "border-radius:4px}.ok{color:#087a4b;font-weight:700}"
+        "</style>"
+        "</head>"
+        "<body><main>"
+        "<p class=\"ok\">HTTP request received successfully</p>"
+        "<h1>Linux System Programming Socket Demo</h1>"
+        "<p>Trang nay duoc tra ve boi chuong trinh C <code>socket_demo</code>.</p>"
+        "<p>Server dang lang nghe tai <code>127.0.0.1:9090</code> va dung cac ham "
+        "<code>socket</code>, <code>bind</code>, <code>listen</code>, "
+        "<code>accept</code>, <code>recv</code> va <code>send</code>.</p>"
+        "</main></body></html>";
+    ssize_t received = recv(client_fd, request, sizeof(request) - 1, 0);
 
-    int cfd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(9090)};
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-        const char *msg = "hello echo server";
-        char buf[256] = {0};
-        send(cfd, msg, strlen(msg), 0);
-        recv(cfd, buf, sizeof(buf) - 1, 0);
-        CLIENT("echo response: %s", buf);
-    } else {
-        ERR("connect: %s", strerror(errno));
+    if (received <= 0)
+        return;
+
+    request[received] = '\0';
+    char *line_end = strstr(request, "\r\n");
+    if (line_end)
+        *line_end = '\0';
+
+    SERVER("request from %s:%u: %s",
+           inet_ntoa(client_addr->sin_addr),
+           ntohs(client_addr->sin_port),
+           request);
+    fflush(stdout);
+
+    int response_length = snprintf(
+        response,
+        sizeof(response),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-store\r\n"
+        "\r\n"
+        "%s",
+        strlen(body),
+        body);
+
+    if (response_length > 0 && (size_t)response_length < sizeof(response))
+        send_all(client_fd, response, (size_t)response_length);
+}
+
+int main(void)
+{
+    int server_fd;
+    int reuse = 1;
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(PORT),
+    };
+    struct sigaction stop_action = {0};
+    struct sigaction child_action = {0};
+
+    stop_action.sa_handler = stop_server;
+    sigemptyset(&stop_action.sa_mask);
+    sigaction(SIGINT, &stop_action, NULL);
+    sigaction(SIGTERM, &stop_action, NULL);
+
+    child_action.sa_handler = SIG_IGN;
+    child_action.sa_flags = SA_NOCLDWAIT;
+    sigemptyset(&child_action.sa_mask);
+    sigaction(SIGCHLD, &child_action, NULL);
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        ERR("socket: %s", strerror(errno));
+        return 1;
     }
-    close(cfd);
-    pthread_join(tid, NULL);
+
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        ERR("bind %s:%d: %s", HOST, PORT, strerror(errno));
+        close(server_fd);
+        return 1;
+    }
+    if (listen(server_fd, 16) < 0) {
+        ERR("listen: %s", strerror(errno));
+        close(server_fd);
+        return 1;
+    }
+
+    SERVER("listening on http://%s:%d/", HOST, PORT);
+    OK("open the URL in a browser; press Ctrl+C to stop");
+    fflush(stdout);
+
+    while (running) {
+        struct sockaddr_in client_address;
+        socklen_t client_length = sizeof(client_address);
+        int client_fd = accept(
+            server_fd,
+            (struct sockaddr *)&client_address,
+            &client_length);
+
+        if (client_fd < 0) {
+            if (errno == EINTR)
+                continue;
+            ERR("accept: %s", strerror(errno));
+            break;
+        }
+
+        pid_t child = fork();
+        if (child == 0) {
+            close(server_fd);
+            handle_client(client_fd, &client_address);
+            close(client_fd);
+            _exit(0);
+        }
+        if (child < 0)
+            ERR("fork: %s", strerror(errno));
+        close(client_fd);
+    }
+
+    close(server_fd);
+    SERVER("stopped");
     return 0;
 }

@@ -5,32 +5,177 @@ import fnmatch
 import html
 import json
 import os
+import re
+import signal
 import socket
 import shutil
+import stat
 import subprocess
 import sys
+import threading
+import time
 import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
 PORT = 8088
+SOCKET_DEMO_URL = "http://127.0.0.1:9090/"
+socket_demo_process = None
+socket_demo_lock = threading.Lock()
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def run_cmd(args, cwd=ROOT, timeout=120):
+def clean_output(value):
+    return ANSI_ESCAPE.sub("", value or "")
+
+
+def run_cmd(args, cwd=ROOT, timeout=120, input_text=None):
     try:
         proc = subprocess.run(
             args,
             cwd=str(cwd),
             text=True,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
         )
-        return {"ok": proc.returncode == 0, "code": proc.returncode, "output": proc.stdout}
+        return {"ok": proc.returncode == 0, "code": proc.returncode, "output": clean_output(proc.stdout)}
     except subprocess.TimeoutExpired as exc:
         return {"ok": False, "code": 124, "output": f"Timeout after {timeout}s\n{exc.stdout or ''}"}
     except FileNotFoundError as exc:
         return {"ok": False, "code": 127, "output": str(exc)}
+
+
+def run_sudo_cmd(data, args, cwd=ROOT, timeout=120):
+    password = data.get("sudo_password", "")
+    if password:
+        return run_cmd(["sudo", "-S", "-p", ""] + args, cwd=cwd, timeout=timeout, input_text=password + "\n")
+    return run_cmd(["sudo"] + args, cwd=cwd, timeout=timeout)
+
+
+def action_socket_start(_):
+    global socket_demo_process
+
+    binary = ROOT / "02_system_prog" / "bin" / "socket_demo"
+    if not binary.exists():
+        return {"ok": False, "output": "Chua co binary. Hay bam Build truoc."}
+
+    with socket_demo_lock:
+        if socket_demo_process and socket_demo_process.poll() is None:
+            return {
+                "ok": True,
+                "output": f"HTTP server dang chay.\nMo trinh duyet: {SOCKET_DEMO_URL}",
+            }
+
+        socket_demo_process = subprocess.Popen(
+            [str(binary)],
+            cwd=str(ROOT / "02_system_prog"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(0.2)
+        if socket_demo_process.poll() is not None:
+            code = socket_demo_process.returncode
+            socket_demo_process = None
+            return {
+                "ok": False,
+                "output": (
+                    f"Khong khoi dong duoc HTTP server (exit code {code}).\n"
+                    "Kiem tra port 9090 co dang bi su dung khong."
+                ),
+            }
+
+    return {
+        "ok": True,
+        "output": (
+            "HTTP server da khoi dong.\n"
+            f"Mo trinh duyet: {SOCKET_DEMO_URL}\n"
+            "Sau khi test, bam Stop HTTP."
+        ),
+    }
+
+
+def action_socket_stop(_):
+    global socket_demo_process
+
+    with socket_demo_lock:
+        if not socket_demo_process or socket_demo_process.poll() is not None:
+            socket_demo_process = None
+            return {"ok": True, "output": "HTTP server hien khong chay."}
+
+        try:
+            os.killpg(socket_demo_process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            socket_demo_process = None
+            return {"ok": True, "output": "HTTP server da dung."}
+        try:
+            socket_demo_process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(socket_demo_process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            socket_demo_process.wait(timeout=3)
+        socket_demo_process = None
+
+    return {"ok": True, "output": "Da dung HTTP server tren port 9090."}
+
+
+def action_driver_nodes(data):
+    nodes = [
+        (Path("/dev/mychardev0"), 0),
+        (Path("/dev/mychardev1"), 1),
+    ]
+    messages = []
+
+    for path, minor in nodes:
+        try:
+            device_stat = path.stat()
+        except FileNotFoundError:
+            created = run_sudo_cmd(
+                data,
+                ["mknod", "-m", "666", str(path), "c", "42", str(minor)],
+            )
+            if not created["ok"]:
+                return {
+                    "ok": False,
+                    "output": (
+                        f"Khong tao duoc {path}:\n"
+                        + (created["output"] or f"exit code {created['code']}")
+                    ),
+                }
+            messages.append(f"Da tao {path} (major=42, minor={minor}).")
+            continue
+
+        if not stat.S_ISCHR(device_stat.st_mode):
+            return {"ok": False, "output": f"{path} da ton tai nhung khong phai character device."}
+        if os.major(device_stat.st_rdev) != 42 or os.minor(device_stat.st_rdev) != minor:
+            return {
+                "ok": False,
+                "output": (
+                    f"{path} co major/minor khong dung: "
+                    f"{os.major(device_stat.st_rdev)},{os.minor(device_stat.st_rdev)}."
+                ),
+            }
+        messages.append(f"{path} da ton tai dung major=42, minor={minor}.")
+
+    permissions = run_sudo_cmd(
+        data,
+        ["chmod", "666", "/dev/mychardev0", "/dev/mychardev1"],
+    )
+    if not permissions["ok"]:
+        return {
+            "ok": False,
+            "output": (
+                "Da co device node nhung khong cap duoc quyen 666:\n"
+                + (permissions["output"] or f"exit code {permissions['code']}")
+            ),
+        }
+
+    messages.append("Da cap quyen rw-rw-rw- cho ca hai device node.")
+    return {"ok": True, "output": "\n".join(messages)}
 
 
 def safe_path(value):
@@ -45,8 +190,12 @@ def table(rows):
 
 
 def valid_cron_field(value, low=None, high=None):
+    value = str(value).strip()
     if value == "*":
         return True
+    if value.startswith("*/") and value[2:].isdigit():
+        step = int(value[2:])
+        return step > 0 and (high is None or step <= high + 1)
     if not value.isdigit():
         return False
     number = int(value)
@@ -132,32 +281,67 @@ def action_cron_list(_):
     return run_cmd(["crontab", "-l"])
 
 
+def read_crontab_lines():
+    current = run_cmd(["crontab", "-l"])
+    if current["code"] == 0:
+        return {"ok": True, "lines": [line for line in current["output"].splitlines() if line.strip()]}
+    if "no crontab for" in current["output"].lower():
+        return {"ok": True, "lines": []}
+    return {"ok": False, "error": current}
+
+
+def write_crontab_lines(lines):
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+    proc = subprocess.run(
+        ["crontab", "-"],
+        input=content,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return {"ok": proc.returncode == 0, "code": proc.returncode, "output": proc.stdout}
+
+
 def action_cron_add(data):
-    minute = data.get("minute", "*")
-    hour = data.get("hour", "*")
+    minute = str(data.get("minute", "*")).strip()
+    hour = str(data.get("hour", "*")).strip()
     command = data.get("command", "").strip()
     if not command:
         return {"ok": False, "output": "Lenh cron dang trong."}
     if not (valid_cron_field(minute, 0, 59) and valid_cron_field(hour, 0, 23)):
         return {"ok": False, "output": "Minute/hour khong hop le."}
-    current = run_cmd(["crontab", "-l"])
-    lines = [] if current["code"] != 0 else [line for line in current["output"].splitlines() if line.strip()]
-    lines.append(f"{minute} {hour} * * * {command}")
-    proc = subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return {"ok": proc.returncode == 0, "output": proc.stdout or "Da them cron job."}
+    result = read_crontab_lines()
+    if not result["ok"]:
+        err = result["error"]
+        return {"ok": False, "output": "Khong doc duoc crontab hien tai:\n" + (err["output"] or f"exit code {err['code']}")}
+    new_job = f"{minute} {hour} * * * {command}"
+    lines = result["lines"]
+    lines.append(new_job)
+    written = write_crontab_lines(lines)
+    if not written["ok"]:
+        return {"ok": False, "output": "Khong ghi duoc crontab:\n" + (written["output"] or f"exit code {written['code']}")}
+    return {"ok": True, "output": "Da them cron job:\n" + new_job + "\n\nCrontab hien tai:\n" + table(lines)}
 
 
 def action_cron_delete(data):
-    index = int(data.get("index") or 0)
-    current = run_cmd(["crontab", "-l"])
-    if current["code"] != 0:
-        return current
-    lines = [line for line in current["output"].splitlines() if line.strip()]
+    try:
+        index = int(data.get("index") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "output": "STT khong hop le."}
+    result = read_crontab_lines()
+    if not result["ok"]:
+        err = result["error"]
+        return {"ok": False, "output": "Khong doc duoc crontab hien tai:\n" + (err["output"] or f"exit code {err['code']}")}
+    lines = result["lines"]
     if index < 1 or index > len(lines):
         return {"ok": False, "output": "STT khong hop le."}
     removed = lines.pop(index - 1)
-    proc = subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return {"ok": proc.returncode == 0, "output": proc.stdout or f"Da xoa: {removed}"}
+    written = write_crontab_lines(lines)
+    if not written["ok"]:
+        return {"ok": False, "output": "Khong ghi duoc crontab:\n" + (written["output"] or f"exit code {written['code']}")}
+    return {"ok": True, "output": f"Da xoa: {removed}\n\nCrontab hien tai:\n" + table(lines)}
 
 
 ACTIONS = {
@@ -172,10 +356,11 @@ ACTIONS = {
     "cron.add": action_cron_add,
     "cron.delete": action_cron_delete,
     "time.status": lambda data: run_cmd(["timedatectl"]),
-    "time.hwclock": lambda data: run_cmd(["hwclock"]),
-    "time.set_timezone": lambda data: run_cmd(["sudo", "timedatectl", "set-timezone", data.get("timezone", "")]),
-    "time.ntp_on": lambda data: run_cmd(["sudo", "timedatectl", "set-ntp", "true"]),
-    "time.set_manual": lambda data: run_cmd(["sudo", "timedatectl", "set-time", data.get("time", "")]),
+    "time.hwclock": lambda data: run_sudo_cmd(data, ["hwclock", "--verbose"]),
+    "time.set_timezone": lambda data: run_sudo_cmd(data, ["timedatectl", "set-timezone", data.get("timezone", "")]),
+    "time.ntp_on": lambda data: run_sudo_cmd(data, ["timedatectl", "set-ntp", "true"]),
+    "time.ntp_off": lambda data: run_sudo_cmd(data, ["timedatectl", "set-ntp", "false"]),
+    "time.set_manual": lambda data: run_sudo_cmd(data, ["timedatectl", "set-time", data.get("time", "")]),
     "pkg.search": lambda data: run_cmd(["apt-cache", "search", data.get("query", "")]),
     "pkg.show": lambda data: run_cmd(["apt-cache", "show", data.get("package", "")]),
     "pkg.list": lambda data: run_cmd(["bash", "-lc", f"dpkg -l | grep -i -- {sh_quote(data.get('pattern', ''))} || true"]),
@@ -184,7 +369,8 @@ ACTIONS = {
     "system.build": lambda data: run_cmd(["make"], cwd=ROOT / "02_system_prog", timeout=300),
     "system.process": lambda data: run_cmd(["./bin/process_mgmt"], cwd=ROOT / "02_system_prog"),
     "system.file": lambda data: run_cmd(["./bin/file_ops"], cwd=ROOT / "02_system_prog"),
-    "system.socket": lambda data: run_cmd(["./bin/socket_demo"], cwd=ROOT / "02_system_prog"),
+    "system.socket_start": action_socket_start,
+    "system.socket_stop": action_socket_stop,
     "system.network": lambda data: run_cmd(["./bin/network_info"], cwd=ROOT / "02_system_prog"),
     "kernel.build": lambda data: run_cmd(["make"], cwd=ROOT / "03_kernel_module", timeout=300),
     "kernel.load": lambda data: run_cmd(["sudo", "insmod", "hello_module.ko"], cwd=ROOT / "03_kernel_module"),
@@ -192,11 +378,11 @@ ACTIONS = {
     "kernel.dmesg": lambda data: run_cmd(["sudo", "dmesg", "--ctime", "--level=info,err,warn"], timeout=20),
     "kernel.unload": lambda data: run_cmd(["sudo", "rmmod", "hello_module"]),
     "driver.build": lambda data: run_cmd(["make"], cwd=ROOT / "04_char_driver", timeout=300),
-    "driver.load": lambda data: run_cmd(["sudo", "insmod", "mychardev.ko"], cwd=ROOT / "04_char_driver"),
-    "driver.nodes": lambda data: run_cmd(["bash", "-lc", "sudo mknod -m 666 /dev/mychardev0 c 42 0 2>/dev/null || true; sudo mknod -m 666 /dev/mychardev1 c 42 1 2>/dev/null || true; sudo chmod 666 /dev/mychardev0 /dev/mychardev1"]),
+    "driver.load": lambda data: run_sudo_cmd(data, ["insmod", "mychardev.ko"], cwd=ROOT / "04_char_driver"),
+    "driver.nodes": action_driver_nodes,
     "driver.test_app": lambda data: run_cmd(["./test_app"], cwd=ROOT / "04_char_driver"),
     "driver.test_blocking": lambda data: run_cmd(["./test_blocking"], cwd=ROOT / "04_char_driver", timeout=20),
-    "driver.unload": lambda data: run_cmd(["sudo", "rmmod", "mychardev"]),
+    "driver.unload": lambda data: run_sudo_cmd(data, ["rmmod", "mychardev"]),
 }
 
 
@@ -322,6 +508,7 @@ pre { margin: 0; padding: 14px; min-height: 520px; max-height: 70vh; overflow: a
           <div class="grid">
             <div class="panel"><h3>Danh sach cron</h3><button class="action" data-action="cron.list">Tai danh sach</button></div>
             <div class="panel"><h3>Them job</h3>
+              <p class="hint">Phut: * chay moi phut, 1 chay vao phut thu 1 moi gio, */5 chay moi 5 phut.</p>
               <div class="row two"><div><label>Phut</label><input id="cron-minute" value="*"></div><div><label>Gio</label><input id="cron-hour" value="*"></div></div>
               <div class="row"><label>Lenh</label><input id="cron-command" value="echo hello >> /tmp/sysproject.log"></div>
               <button class="action ok" data-confirm="Them cron job nay?" data-action="cron.add" data-fields="minute:cron-minute,hour:cron-hour,command:cron-command">Them job</button>
@@ -331,10 +518,11 @@ pre { margin: 0; padding: 14px; min-height: 520px; max-height: 70vh; overflow: a
         </section>
         <section class="section" id="time">
           <div class="grid">
-            <div class="panel"><h3>Trang thai thoi gian</h3><div class="actions"><button class="action" data-action="time.status">timedatectl</button><button class="action secondary" data-action="time.hwclock">Hardware clock</button></div></div>
-            <div class="panel"><h3>Dat timezone</h3><div class="row"><label>Timezone</label><input id="timezone" value="Asia/Ho_Chi_Minh"></div><button class="action warn" data-confirm="Can sudo. Tiep tuc?" data-action="time.set_timezone" data-fields="timezone:timezone">Dat timezone</button></div>
-            <div class="panel"><h3>NTP</h3><button class="action ok" data-confirm="Bat NTP sync?" data-action="time.ntp_on">Bat NTP</button></div>
-            <div class="panel"><h3>Dat gio thu cong</h3><div class="row"><label>YYYY-MM-DD HH:MM:SS</label><input id="manual-time" value="2026-06-14 12:00:00"></div><button class="action danger" data-confirm="Can sudo va co the anh huong he thong. Tiep tuc?" data-action="time.set_manual" data-fields="time:manual-time">Dat gio</button></div>
+            <div class="panel"><h3>Quyen sudo</h3><p class="hint">Nhap mat khau sudo neu thao tac can quyen root.</p><div class="row"><label>Mat khau sudo</label><input id="sudo-password" type="password" autocomplete="current-password"></div></div>
+            <div class="panel"><h3>Trang thai thoi gian</h3><div class="actions"><button class="action" data-action="time.status">timedatectl</button><button class="action secondary" data-action="time.hwclock" data-fields="sudo_password:sudo-password">Hardware clock</button></div></div>
+            <div class="panel"><h3>Dat timezone</h3><div class="row"><label>Timezone</label><input id="timezone" value="Asia/Ho_Chi_Minh"></div><button class="action warn" data-confirm="Can sudo. Tiep tuc?" data-action="time.set_timezone" data-fields="timezone:timezone,sudo_password:sudo-password">Dat timezone</button></div>
+            <div class="panel"><h3>NTP</h3><div class="actions"><button class="action ok" data-confirm="Bat NTP sync?" data-action="time.ntp_on" data-fields="sudo_password:sudo-password">Bat NTP</button><button class="action danger" data-confirm="Tat NTP sync?" data-action="time.ntp_off" data-fields="sudo_password:sudo-password">Tat NTP</button></div></div>
+            <div class="panel"><h3>Dat gio thu cong</h3><div class="row"><label>YYYY-MM-DD HH:MM:SS</label><input id="manual-time" value="2026-06-14 12:00:00"></div><button class="action danger" data-confirm="Can sudo va co the anh huong he thong. Tiep tuc?" data-action="time.set_manual" data-fields="time:manual-time,sudo_password:sudo-password">Dat gio</button></div>
           </div>
         </section>
         <section class="section" id="pkg">
@@ -345,9 +533,19 @@ pre { margin: 0; padding: 14px; min-height: 520px; max-height: 70vh; overflow: a
             <div class="panel"><h3>Da cai</h3><div class="row"><label>Pattern</label><input id="pkg-pattern" value="gcc"></div><button class="action" data-action="pkg.list" data-fields="pattern:pkg-pattern">List</button></div>
           </div>
         </section>
-        <section class="section" id="system"><div class="panel"><h3>System Programming C</h3><p class="hint">Build truoc, sau do chay tung demo.</p><div class="actions"><button class="action ok" data-action="system.build">Build</button><button class="action" data-action="system.process">Process</button><button class="action" data-action="system.file">File Ops</button><button class="action" data-action="system.socket">Socket</button><button class="action" data-action="system.network">Network</button></div></div></section>
+        <section class="section" id="system">
+          <div class="grid">
+            <div class="panel"><h3>System Programming C</h3><p class="hint">Build truoc, sau do chay tung demo.</p><div class="actions"><button class="action ok" data-action="system.build">Build</button><button class="action" data-action="system.process">Process</button><button class="action" data-action="system.file">File Ops</button><button class="action" data-action="system.network">Network</button></div></div>
+            <div class="panel"><h3>HTTP Socket Server</h3><p class="hint">Khoi dong server C, sau do mo dia chi ben duoi trong trinh duyet.</p><p><a href="http://127.0.0.1:9090/" target="_blank" rel="noreferrer">http://127.0.0.1:9090/</a></p><div class="actions"><button class="action ok" data-action="system.socket_start">Start HTTP</button><button class="action danger" data-action="system.socket_stop">Stop HTTP</button></div></div>
+          </div>
+        </section>
         <section class="section" id="kernel"><div class="panel"><h3>Hello Kernel Module</h3><div class="actions"><button class="action ok" data-action="kernel.build">Build</button><button class="action warn" data-confirm="Load kernel module bang sudo insmod?" data-action="kernel.load">Load</button><button class="action" data-action="kernel.proc">/proc/hello_info</button><button class="action secondary" data-action="kernel.dmesg">dmesg</button><button class="action danger" data-confirm="Unload hello_module?" data-action="kernel.unload">Unload</button></div></div></section>
-        <section class="section" id="driver"><div class="panel"><h3>Character Device Driver</h3><div class="actions"><button class="action ok" data-action="driver.build">Build</button><button class="action warn" data-confirm="Load mychardev bang sudo insmod?" data-action="driver.load">Load</button><button class="action secondary" data-confirm="Tao /dev/mychardev0 va /dev/mychardev1?" data-action="driver.nodes">Create nodes</button><button class="action" data-action="driver.test_app">Test app</button><button class="action" data-action="driver.test_blocking">Blocking test</button><button class="action danger" data-confirm="Unload mychardev?" data-action="driver.unload">Unload</button></div></div></section>
+        <section class="section" id="driver">
+          <div class="grid">
+            <div class="panel"><h3>Quyen sudo</h3><p class="hint">Mat khau chi duoc gui cho thao tac Load, Create nodes hoac Unload.</p><div class="row"><label>Mat khau sudo</label><input id="driver-sudo-password" type="password" autocomplete="current-password"></div></div>
+            <div class="panel"><h3>Character Device Driver</h3><div class="actions"><button class="action ok" data-action="driver.build">Build</button><button class="action warn" data-confirm="Load mychardev bang sudo insmod?" data-action="driver.load" data-fields="sudo_password:driver-sudo-password">Load</button><button class="action secondary" data-confirm="Tao /dev/mychardev0 va /dev/mychardev1?" data-action="driver.nodes" data-fields="sudo_password:driver-sudo-password">Create nodes</button><button class="action" data-action="driver.test_app">Test app</button><button class="action" data-action="driver.test_blocking">Blocking test</button><button class="action danger" data-confirm="Unload mychardev?" data-action="driver.unload" data-fields="sudo_password:driver-sudo-password">Unload</button></div></div>
+          </div>
+        </section>
       </div>
       <aside class="output"><header><strong>Output</strong><span class="status" id="status">Ready</span></header><pre id="out">Chon mot thao tac de bat dau.</pre></aside>
     </div>
@@ -454,6 +652,9 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping GUI app.")
+    finally:
+        action_socket_stop({})
+        server.server_close()
 
 
 if __name__ == "__main__":
